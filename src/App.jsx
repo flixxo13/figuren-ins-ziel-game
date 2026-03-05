@@ -267,9 +267,14 @@ function gameReducer(state,act){
         history:g.history.slice(0,-1),log:[...g.log,'↩️ Rückgängig'].slice(-60),
         turnId:g.turnId+1,lastMove:null}};
     }
-    case 'ROLL':{
+    case 'ROLL':
+    case 'ROLL_WITH_DICE':{
       const{g}=state; if(!g||g.phase!=='rolling') return state;
-      const player=g.players[g.cur],d=rollDie(),newSixes=d===6?g.sixes+1:0;
+      const player=g.players[g.cur];
+      // ROLL_WITH_DICE bekommt den Wert von außen (für Online-Sync),
+      // ROLL würfelt selbst (lokal & KI)
+      const d=act.type==='ROLL_WITH_DICE'?act.dice:rollDie();
+      const newSixes=d===6?g.sixes+1:0;
       const snap={players:deepClone(g.players),cur:g.cur,sixes:g.sixes};
       const hist=[...g.history,snap].slice(-10);
       if(newSixes>=3) return{...state,g:{...g,dice:d,sixes:0,cur:(g.cur+1)%g.players.length,
@@ -290,7 +295,10 @@ function gameReducer(state,act){
         turnId:g.turnId+1,lastMove:null}};
     }
     case 'ROLL_REMOTE':{
-      // Eingehender Würfelwurf von einem anderen Spieler online.
+      // Eingehender Würfelwurf von einem anderen Online-Spieler.
+      // WICHTIG: Kein auto-applyPick auch bei valid.length===1 —
+      // der Remote-Spieler schickt immer ein explizites PICK via Firebase.
+      // So bleibt der State bei allen Instanzen synchron.
       const{g}=state; if(!g||g.phase!=='rolling') return state;
       const player=g.players[g.cur],d=act.dice,newSixes=d===6?g.sixes+1:0;
       const snap={players:deepClone(g.players),cur:g.cur,sixes:g.sixes};
@@ -304,12 +312,10 @@ function gameReducer(state,act){
         cur:(g.cur+1)%g.players.length,phase:'rolling',sel:[],history:hist,
         log:[...g.log,`${player.name} würfelt ${d} – kein Zug möglich`].slice(-60),
         turnId:g.turnId+1,lastMove:null}};
-      if(valid.length===1)
-        return applyPick({...state,g:{...g,dice:d,sixes:newSixes,history:hist,
-          log:[...g.log,`${player.name} würfelt ${d}`].slice(-60),turnId:g.turnId+1}},valid[0]);
+      // Immer picking — Remote-Spieler sendet PICK separat
       return{...state,g:{...g,dice:d,sixes:newSixes,history:hist,
         phase:'picking',sel:valid.map(p=>p.id),
-        log:[...g.log,`${player.name} würfelt ${d} – Figur wählen!`].slice(-60),
+        log:[...g.log,`${player.name} würfelt ${d}…`].slice(-60),
         turnId:g.turnId+1,lastMove:null}};
     }
     case 'PICK':{
@@ -766,16 +772,25 @@ function OnlineLobby({ onGameStart, onBack }) {
 
   const buildConfigs = (players, max) => {
     const online = Object.values(players);
-    // Genau max Farben — online Spieler werden erkannt, Rest = KI
+    // max = vom Host gewählt. Online-Spieler werden erkannt.
+    // Leere Plätze bis max werden mit KI aufgefüllt — NUR wenn max > online.length.
+    // Wichtig: Wir nehmen exakt 'max' Farben, nicht mehr.
     return ONLINE_COLORS.slice(0, max).map((color) => {
       const p = online.find(pl => pl.color === color);
       return {
         color, active: true,
-        name: p?.name ?? `KI ${color}`,
+        name: p ? p.name : `KI ${color}`,
         isAI: !p,
         diff: 'medium',
       };
     });
+  };
+
+  // Beim Start: maxPlayers = Anzahl tatsächlich beigetretener Spieler
+  // (nicht der vom Host eingestellte Wert, falls weniger kamen)
+  const effectiveMaxPlayers = (players) => {
+    const count = Object.keys(players).length;
+    return Math.max(2, Math.min(count, maxPlayers));
   };
 
   const handleCreate = async () => {
@@ -796,9 +811,9 @@ function OnlineLobby({ onGameStart, onBack }) {
   };
 
   const handleStart = async () => {
-    // Configs berechnen und in Firebase speichern → alle Spieler lesen sie
-    const cfgs = buildConfigs(roomPlayers, maxPlayers);
-    await mp.startGame(cfgs);  // cfgs wird an startGame übergeben
+    const effMax = effectiveMaxPlayers(roomPlayers);
+    const cfgs = buildConfigs(roomPlayers, effMax);
+    await mp.startGame(cfgs);
     onGameStart({ configs: cfgs, roomCode: mp.roomCode,
       myColor: mp.myColor, sendAction: mp.sendAction,
       saveState: mp.saveState, myId: mp.myId });
@@ -1009,12 +1024,19 @@ export default function App(){
   const aiTimerRef=useRef(null);
 
   // ── Online: Spiel starten nach Lobby ────────────────────────
-  // Wird von OnlineLobby aufgerufen wenn alle Spieler bereit sind.
-  // configs = Spieler-Array wie beim lokalen Spiel
-  // sendAction = Funktion um Züge zu Firebase zu senden
-  // myColor = diese Instanz spielt diese Farbe
-  const handleOnlineStart = useCallback(({ configs, sendAction, myColor, myId, saveState }) => {
-    onlineCtxRef.current = { sendAction, myColor, myId, saveState };
+  const handleOnlineStart = useCallback(({ configs, roomCode, sendAction, myColor, myId, saveState }) => {
+    // DIREKT einen Firebase-Listener aufsetzen für eingehende Spielzüge.
+    // handleRemoteAction ist in App definiert und ruft dispatch() auf.
+    // Dies ersetzt den toten onAction-Kanal in useMultiplayer/OnlineLobby.
+    const unsub = fbListen(`rooms/${roomCode}/lastAction`, action => {
+      if (!action || action.from === myId) return; // eigene ignorieren
+      if (action.type === 'ROLL_RESULT') {
+        dispatch({ type:'ROLL_REMOTE', dice: action.payload.dice });
+      } else if (action.type === 'PICK') {
+        dispatch({ type:'PICK', id: action.payload.id });
+      }
+    });
+    onlineCtxRef.current = { sendAction, myColor, myId, saveState, roomCode, unsubActions: unsub };
     dispatch({ type:'START', cfg: configs });
     setScreen('game');
   }, []);
@@ -1038,7 +1060,6 @@ export default function App(){
     if(anim.blocked) return;
     const g=gRef.current;
     if(!g||g.phase!=='rolling') return;
-    // Im Online-Modus: nur meine eigene Farbe darf würfeln
     const curPlayer = g.players[g.cur];
     if(onlineCtxRef.current && curPlayer.color !== onlineCtxRef.current.myColor) return;
     if(curPlayer.isAI) return;
@@ -1047,15 +1068,10 @@ export default function App(){
     anim.clearTimers();
     prevLastMoveRef.current=g.lastMove;
     anim.runDiceAnimation(1300,()=>{
-      dispatch({type:'ROLL'});
-      // Online: Würfelergebnis an andere senden (nach dispatch damit dice bekannt)
-      // Wir lesen aus gRef da state noch nicht aktuell ist
-      setTimeout(()=>{
-        const newG = gRef.current;
-        if(onlineCtxRef.current && newG?.dice) {
-          onlineCtxRef.current.sendAction('ROLL_RESULT', { dice: newG.dice });
-        }
-      }, 50);
+      // Würfelwert ZUERST bestimmen, dann dispatchen und senden
+      const dice = Math.floor(Math.random()*6)+1;
+      dispatch({type:'ROLL_WITH_DICE', dice});
+      onlineCtxRef.current?.sendAction('ROLL_RESULT', { dice });
     });
   },[anim]);
 
@@ -1066,7 +1082,7 @@ export default function App(){
     anim.setShowPicker(false);
     prevLastMoveRef.current=gRef.current?.lastMove??null;
     dispatch({type:'PICK',id});
-    // Online: Wahl an andere senden
+    // Online: immer senden, auch bei Einzeloption
     onlineCtxRef.current?.sendAction('PICK', { id });
   },[anim]);
 
@@ -1104,9 +1120,13 @@ export default function App(){
     const setupNextTurn=()=>{
       const gc=gRef.current; if(!gc||gc.phase==='over') return;
       const nextP=gc.players[gc.cur];
+      const onlineCtx=onlineCtxRef.current;
+      // Ist der aktuelle Spieler ein Online-Gegner?
+      // = Online-Modus aktiv UND nicht meine Farbe UND kein KI
+      const isRemotePlayer = onlineCtx && !nextP?.isAI && nextP?.color !== onlineCtx.myColor;
 
       if(gc.phase==='rolling' && nextP?.isAI){
-        // KI würfelt
+        // KI würfelt (nur lokal, nicht im reinen Online-Modus)
         if(handledTurnRef.current===gc.turnId) return;
         handledTurnRef.current=gc.turnId;
         anim.setBlocked(true);
@@ -1115,8 +1135,12 @@ export default function App(){
           anim.runDiceAnimation(900,()=>dispatch({type:'ROLL'}));
         }, 500);
 
+      } else if(gc.phase==='rolling' && isRemotePlayer){
+        // Online-Gegner ist dran — einfach warten, Firebase liefert ROLL_RESULT
+        anim.setBlocked(false);
+
       } else if(gc.phase==='ai'){
-        // KI wählt Figur (mehrere Optionen)
+        // KI wählt Figur
         if(handledTurnRef.current===gc.turnId) return;
         handledTurnRef.current=gc.turnId;
         aiTimerRef.current=setTimeout(()=>{
@@ -1128,12 +1152,16 @@ export default function App(){
           dispatch({type:'PICK',id:chosen.id});
         }, 500);
 
+      } else if(gc.phase==='picking' && isRemotePlayer){
+        // Online-Gegner wählt Figur — warten auf PICK via Firebase
+        anim.setBlocked(false);
+
       } else if(gc.phase==='picking'){
-        // Mensch wählt Figur
+        // Lokaler Mensch wählt Figur
         anim.after(400,()=>{anim.setShowPicker(true); anim.setBlocked(false);});
 
       } else {
-        // Mensch würfelt — einfach unblockieren
+        // Lokaler Mensch würfelt
         anim.setBlocked(false);
       }
     };
