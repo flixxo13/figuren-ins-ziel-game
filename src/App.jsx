@@ -657,11 +657,11 @@ function useMultiplayer({ onAction, onPlayersChange }) {
     const upper = code.toUpperCase().trim();
     try {
       const room = await fbRead(`rooms/${upper}`);
-      if (!room) { setError('Raum nicht gefunden.'); setStatus('error'); return; }
-      if (room.gameStarted) { setError('Spiel läuft bereits.'); setStatus('error'); return; }
+      if (!room) { setError('Raum nicht gefunden.'); setStatus('error'); return null; }
+      if (room.gameStarted) { setError('Spiel läuft bereits.'); setStatus('error'); return null; }
       const taken = Object.values(room.players || {}).map(p => p.color);
       const color = ONLINE_COLORS.find(c => !taken.includes(c));
-      if (!color) { setError('Raum ist voll.'); setStatus('error'); return; }
+      if (!color) { setError('Raum ist voll.'); setStatus('error'); return null; }
       await fbWrite(`rooms/${upper}/players/${myId}`, { name: playerName, color, online: true });
       setRoomCode(upper);
       setMyColor(color);
@@ -669,15 +669,20 @@ function useMultiplayer({ onAction, onPlayersChange }) {
       setPlayers({...room.players, [myId]: { name:playerName, color, online:true }});
       watchPlayers(upper);
       watchActions(upper);
+      // maxPlayers aus Firebase zurückgeben damit Lobby es setzen kann
+      return { maxPlayers: room.maxPlayers ?? 2 };
     } catch(e) {
       setError('Verbindung fehlgeschlagen.');
       setStatus('error');
+      return null;
     }
   }, [myId, watchPlayers, watchActions]);
 
-  // Spiel starten (nur Host)
-  const startGame = useCallback(async () => {
+  // Spiel starten (nur Host) — configs wird mitgespeichert
+  const startGame = useCallback(async (configs) => {
     if (!roomCode) return;
+    // Configs in Firebase speichern → alle lesen dieselbe Konfiguration
+    await fbWrite(`rooms/${roomCode}/configs`, configs);
     await fbWrite(`rooms/${roomCode}/gameStarted`, true);
     setStatus('playing');
   }, [roomCode]);
@@ -697,10 +702,16 @@ function useMultiplayer({ onAction, onPlayersChange }) {
   }, [roomCode]);
 
   // Auf Spielstart warten (für nicht-Host)
+  // Configs werden frisch aus Firebase gelesen — kein Closure-Problem
   const watchStart = useCallback((onStart) => {
     if (!roomCode) return;
-    const unsub = fbListen(`rooms/${roomCode}/gameStarted`, val => {
-      if (val === true) { setStatus('playing'); onStart?.(); }
+    const unsub = fbListen(`rooms/${roomCode}/gameStarted`, async val => {
+      if (val === true) {
+        setStatus('playing');
+        // Frische Configs aus Firebase lesen
+        const configs = await fbRead(`rooms/${roomCode}/configs`);
+        onStart?.(configs ?? []);
+      }
     });
     return unsub;
   }, [roomCode]);
@@ -741,12 +752,11 @@ function OnlineLobby({ onGameStart, onBack }) {
   });
 
   // Warten auf Spielstart (nicht-Host)
+  // configs kommt jetzt direkt aus Firebase (frische Daten, kein Closure-Problem)
   useEffect(() => {
     if (mp.status === 'lobby' && !isHost) {
-      unsubStartRef.current = mp.watchStart(() => {
-        // Spieler-Config aus Firebase-Daten bauen
-        const cfgs = buildConfigs(roomPlayers, maxPlayers);
-        onGameStart({ configs: cfgs, roomCode: mp.roomCode,
+      unsubStartRef.current = mp.watchStart((configs) => {
+        onGameStart({ configs, roomCode: mp.roomCode,
           myColor: mp.myColor, sendAction: mp.sendAction,
           saveState: mp.saveState, myId: mp.myId });
       });
@@ -756,7 +766,8 @@ function OnlineLobby({ onGameStart, onBack }) {
 
   const buildConfigs = (players, max) => {
     const online = Object.values(players);
-    return ONLINE_COLORS.slice(0, max).map((color, i) => {
+    // Genau max Farben — online Spieler werden erkannt, Rest = KI
+    return ONLINE_COLORS.slice(0, max).map((color) => {
       const p = online.find(pl => pl.color === color);
       return {
         color, active: true,
@@ -776,13 +787,18 @@ function OnlineLobby({ onGameStart, onBack }) {
 
   const handleJoin = async () => {
     if (!name.trim() || !joinCode.trim()) return;
-    await mp.joinRoom(joinCode, name.trim());
-    setView('waiting');
+    // joinRoom gibt jetzt maxPlayers aus Firebase zurück
+    const result = await mp.joinRoom(joinCode, name.trim());
+    if (result) {
+      setMaxPlayers(result.maxPlayers); // Firebase-Wert übernehmen
+      setView('waiting');
+    }
   };
 
   const handleStart = async () => {
+    // Configs berechnen und in Firebase speichern → alle Spieler lesen sie
     const cfgs = buildConfigs(roomPlayers, maxPlayers);
-    await mp.startGame();
+    await mp.startGame(cfgs);  // cfgs wird an startGame übergeben
     onGameStart({ configs: cfgs, roomCode: mp.roomCode,
       myColor: mp.myColor, sendAction: mp.sendAction,
       saveState: mp.saveState, myId: mp.myId });
@@ -823,10 +839,15 @@ function OnlineLobby({ onGameStart, onBack }) {
         <div style={{width:'100%',display:'flex',flexDirection:'column',gap:10}}>
           <input placeholder="Dein Name" value={name}
             onChange={e=>setName(e.target.value)} style={inp}/>
-          <button onClick={()=>{if(name.trim())setView('create');}} style={btn()}>
+          {!name.trim()&&<p style={{color:'#f87171',fontSize:12,margin:0,fontFamily:'system-ui',textAlign:'center'}}>
+            Bitte zuerst deinen Namen eingeben
+          </p>}
+          <button onClick={()=>{if(name.trim())setView('create');}}
+            disabled={!name.trim()}
+            style={btn(name.trim()?'#f0e6cc':'#221810', name.trim()?'#0f0d08':'#4a3020')}>
             🏠 Raum erstellen
           </button>
-          <button onClick={()=>{if(name.trim())setView('join');}}
+          <button onClick={()=>setView('join')}
             style={btn('transparent','#f0e6cc')}>
             🔑 Raum beitreten
           </button>
@@ -867,13 +888,19 @@ function OnlineLobby({ onGameStart, onBack }) {
       {/* JOIN */}
       {view==='join' && (
         <div style={{width:'100%',display:'flex',flexDirection:'column',gap:10}}>
+          {/* Name falls noch nicht eingegeben */}
+          <input placeholder="Dein Name"
+            value={name} onChange={e=>setName(e.target.value)} style={inp}/>
           <input placeholder="6-stelliger Code z.B. XK7F2Q"
             value={joinCode} onChange={e=>setJoinCode(e.target.value.toUpperCase())}
             style={{...inp,letterSpacing:4,fontSize:18,textAlign:'center'}}
             maxLength={6}/>
           <button onClick={handleJoin}
-            disabled={mp.status==='joining'||joinCode.length<6}
-            style={btn()}>
+            disabled={mp.status==='joining'||joinCode.length<6||!name.trim()}
+            style={btn(
+              (joinCode.length===6&&name.trim())?'#f0e6cc':'#221810',
+              (joinCode.length===6&&name.trim())?'#0f0d08':'#4a3020'
+            )}>
             {mp.status==='joining'?'Verbinde…':'🔑 Beitreten'}
           </button>
           <button onClick={()=>setView('home')} style={btn('transparent','#6a5030')}>
