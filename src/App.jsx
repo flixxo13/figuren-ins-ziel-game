@@ -1111,10 +1111,26 @@ export default function App(){
     anim.clearTimers();
     prevLastMoveRef.current=g.lastMove;
     anim.runDiceAnimation(1300,()=>{
-      // Würfelwert ZUERST bestimmen, dann dispatchen und senden
       const dice = Math.floor(Math.random()*6)+1;
+
+      // ONLINE: gültige Figuren VOR dem Dispatch berechnen.
+      // Wenn nur 1 Option existiert, wendet der Reducer auto-applyPick an
+      // ohne handlePick aufzurufen → PICK wird nie gesendet → Remote hängt.
+      // Lösung: PICK hier direkt mitsenden wenn nötig.
+      if(onlineCtxRef.current){
+        const valid=getSelectable(curPlayer,dice,g.players);
+        const newSixes=dice===6?g.sixes+1:0;
+        onlineCtxRef.current.sendAction('ROLL_RESULT',{dice});
+        if(valid.length===1 && newSixes<3){
+          // Auto-Pick — Remote braucht explizites PICK
+          setTimeout(()=>onlineCtxRef.current?.sendAction('PICK',{id:valid[0].id}),80);
+        }
+        // valid.length===0 oder >=2: kein Auto-Pick, User klickt selbst
+      } else {
+        // Lokal ohne Online
+      }
+
       dispatch({type:'ROLL_WITH_DICE', dice});
-      onlineCtxRef.current?.sendAction('ROLL_RESULT', { dice });
     });
   },[anim]);
 
@@ -1225,12 +1241,27 @@ export default function App(){
 
     } else if(g.phase==='rolling' && !g.players[g.cur]?.isAI){
       // Mensch dran, kein Zug möglich (kein lastMove)
-      if(soundOn) SFX.noMove();
-      anim.after(600,()=>anim.setBlocked(false));
+      const onlineCtx=onlineCtxRef.current;
+      const curP=g.players[g.cur];
+      const isRemote=onlineCtx && curP?.color!==onlineCtx.myColor && !curP?.isAI;
+      if(!isRemote){
+        if(soundOn) SFX.noMove();
+        anim.after(600,()=>anim.setBlocked(false));
+      } else {
+        anim.setBlocked(false);
+      }
 
     } else if(g.phase==='picking'){
-      // Mensch hat mehrere Optionen, kein vorheriger Zug
-      anim.after(400,()=>{anim.setShowPicker(true); anim.setBlocked(false);});
+      // Figur wählen — nur zeigen wenn LOKALER Spieler dran ist
+      const onlineCtx=onlineCtxRef.current;
+      const curP=g.players[g.cur];
+      const isRemote=onlineCtx && curP?.color!==onlineCtx.myColor && !curP?.isAI;
+      if(isRemote){
+        // Remote-Spieler wählt — nur warten, kein lokaler Picker
+        anim.setBlocked(false);
+      } else {
+        anim.after(400,()=>{anim.setShowPicker(true); anim.setBlocked(false);});
+      }
 
     } else {
       // KI-Zug ohne Bewegungs-Animation (z.B. kein Zug möglich)
