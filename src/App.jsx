@@ -42,11 +42,24 @@ const fbRead = async (path) => {
 // Jedes Mal wenn sich der Wert ändert, ruft Firebase cb() auf.
 // Gibt eine "unsubscribe" Funktion zurück → aufrufen zum Abmelden.
 const fbListen = (path, cb) => {
-  const es = new EventSource(`${FB_DB}/${path}.json`);
+  const url = `${FB_DB}/${path}.json`;
+  const es = new EventSource(url);
+
+  // "put" = voller Datensatz an diesem Pfad wurde ersetzt
   es.addEventListener('put', e => {
     try { cb(JSON.parse(e.data)?.data ?? null); } catch {}
   });
-  es.onerror = () => {}; // SSE reconnectet automatisch bei Fehler
+
+  // "patch" = ein Kind-Element wurde geändert (z.B. fbWrite auf Unterpfad)
+  // Firebase schickt patch wenn ein Kind-Pfad per PUT geschrieben wird.
+  // Wir holen dann den kompletten aktuellen Stand per GET nach.
+  es.addEventListener('patch', () => {
+    fetch(url).then(r => r.json()).then(data => {
+      try { cb(data ?? null); } catch {}
+    }).catch(() => {});
+  });
+
+  es.onerror = () => {}; // SSE reconnectet automatisch
   return () => es.close();
 };
 
@@ -665,17 +678,23 @@ function useMultiplayer({ onAction, onPlayersChange }) {
       const room = await fbRead(`rooms/${upper}`);
       if (!room) { setError('Raum nicht gefunden.'); setStatus('error'); return null; }
       if (room.gameStarted) { setError('Spiel läuft bereits.'); setStatus('error'); return null; }
-      const taken = Object.values(room.players || {}).map(p => p.color);
+      const existingPlayers = room.players || {};
+      const taken = Object.values(existingPlayers).map(p => p.color);
       const color = ONLINE_COLORS.find(c => !taken.includes(c));
       if (!color) { setError('Raum ist voll.'); setStatus('error'); return null; }
-      await fbWrite(`rooms/${upper}/players/${myId}`, { name: playerName, color, online: true });
+      // WICHTIG: Vollständiges players-Objekt schreiben (nicht nur den eigenen Eintrag)
+      // → Firebase schickt "put"-Event (nicht "patch") → Host sieht Update sofort
+      const updatedPlayers = {
+        ...existingPlayers,
+        [myId]: { name: playerName, color, online: true }
+      };
+      await fbWrite(`rooms/${upper}/players`, updatedPlayers);
       setRoomCode(upper);
       setMyColor(color);
       setStatus('lobby');
-      setPlayers({...room.players, [myId]: { name:playerName, color, online:true }});
+      setPlayers(updatedPlayers);
       watchPlayers(upper);
       watchActions(upper);
-      // maxPlayers aus Firebase zurückgeben damit Lobby es setzen kann
       return { maxPlayers: room.maxPlayers ?? 2 };
     } catch(e) {
       setError('Verbindung fehlgeschlagen.');
@@ -722,12 +741,35 @@ function useMultiplayer({ onAction, onPlayersChange }) {
     return unsub;
   }, [roomCode]);
 
+  // Raum verlassen / aufräumen
+  const leaveRoom = useCallback(async () => {
+    if (!roomCode) return;
+    // Eigenen Spieler als offline markieren
+    try {
+      const room = await fbRead(`rooms/${roomCode}`);
+      if (room?.players?.[myId]) {
+        const updatedPlayers = {...room.players};
+        delete updatedPlayers[myId];
+        if (Object.keys(updatedPlayers).length === 0) {
+          // Letzter Spieler → ganzen Raum löschen
+          await fbWrite(`rooms/${roomCode}`, null);
+        } else {
+          await fbWrite(`rooms/${roomCode}/players`, updatedPlayers);
+        }
+      }
+    } catch {}
+    unsubRef.current?.();
+    setRoomCode(null);
+    setMyColor(null);
+    setStatus('idle');
+  }, [roomCode, myId]);
+
   // Beim Verlassen aufräumen
   useEffect(() => () => { unsubRef.current?.(); }, []);
 
   return {
     myId, roomCode, myColor, players, status, error,
-    createRoom, joinRoom, startGame, sendAction, saveState, watchStart,
+    createRoom, joinRoom, startGame, sendAction, saveState, watchStart, leaveRoom,
     isHost: (room) => room?.host === myId,
   };
 }
@@ -771,10 +813,8 @@ function OnlineLobby({ onGameStart, onBack }) {
   }, [mp.status, isHost]);
 
   const buildConfigs = (players, max) => {
-    const online = Object.values(players);
-    // max = vom Host gewählt. Online-Spieler werden erkannt.
-    // Leere Plätze bis max werden mit KI aufgefüllt — NUR wenn max > online.length.
-    // Wichtig: Wir nehmen exakt 'max' Farben, nicht mehr.
+    // Nur gültige Spieler-Objekte mit name + color verwenden
+    const online = Object.values(players).filter(p => p && p.name && p.color);
     return ONLINE_COLORS.slice(0, max).map((color) => {
       const p = online.find(pl => pl.color === color);
       return {
@@ -786,11 +826,10 @@ function OnlineLobby({ onGameStart, onBack }) {
     });
   };
 
-  // Beim Start: maxPlayers = Anzahl tatsächlich beigetretener Spieler
-  // (nicht der vom Host eingestellte Wert, falls weniger kamen)
   const effectiveMaxPlayers = (players) => {
-    const count = Object.keys(players).length;
-    return Math.max(2, Math.min(count, maxPlayers));
+    // Nur gültige Spieler zählen
+    const valid = Object.values(players).filter(p => p && p.name && p.color);
+    return Math.max(2, Math.min(valid.length, maxPlayers));
   };
 
   const handleCreate = async () => {
@@ -974,25 +1013,29 @@ function OnlineLobby({ onGameStart, onBack }) {
           </div>
 
           {/* Start-Button (nur Host) */}
-          {isHost && (
-            <button
-              onClick={handleStart}
-              disabled={Object.keys(roomPlayers).length < 2}
-              style={{...btn(
-                Object.keys(roomPlayers).length>=2?'#f0e6cc':'#221810',
-                Object.keys(roomPlayers).length>=2?'#0f0d08':'#4a3020'
-              ), opacity: Object.keys(roomPlayers).length<2?0.5:1}}>
-              {Object.keys(roomPlayers).length<2
-                ? '⏳ Warte auf Mitspieler…'
-                : `🎮 Spiel starten · ${Object.keys(roomPlayers).length} Spieler`}
-            </button>
-          )}
+          {isHost && (()=>{
+            const validPlayers = Object.values(roomPlayers).filter(p=>p&&p.name&&p.color);
+            const canStart = validPlayers.length >= 2;
+            return (
+              <button onClick={handleStart} disabled={!canStart}
+                style={{...btn(canStart?'#f0e6cc':'#221810', canStart?'#0f0d08':'#4a3020'),
+                  opacity:canStart?1:0.5}}>
+                {canStart
+                  ? `🎮 Spiel starten · ${validPlayers.length} Spieler`
+                  : '⏳ Warte auf Mitspieler…'}
+              </button>
+            );
+          })()}
           {!isHost && (
             <div style={{color:'#6a5030',fontSize:13,fontFamily:'system-ui',
               animation:'pulse 2s infinite',textAlign:'center'}}>
               ⏳ Warte bis der Host das Spiel startet…
             </div>
           )}
+          <button onClick={async()=>{await mp.leaveRoom(); onBack();}}
+            style={btn('transparent','#6a5030')}>
+            ← Verlassen
+          </button>
         </div>
       )}
     </div>
